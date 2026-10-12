@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+subrecon-env/
+venv/
+.venv/
+
+# Secrets - never commit these
+.env
+*.key
+
+# Outputs and target lists
+*.xlsx
+domains.txt
+targets*.txt
