@@ -6,13 +6,13 @@ subrecon.py - Subdomain enumeration pipeline with WHOIS and a styled Excel repor
 Steps (per domain):
   1. Subfinder      2. Assetfinder   3. Findomain
   4. Chaos (API)    5. crt.sh        6. GitHub Dorking (token)
-  then: merge + dedupe + sort -> DNS resolve + WHOIS -> Excel
+  then: merge + dedupe + sort -> DNS resolve + WHOIS -> httpx (http_live) -> Excel
 
 Use ONLY on domains you own or are explicitly authorized to test.
 
 Install:
   pip install requests python-whois openpyxl
-  + tools in PATH: subfinder, assetfinder, findomain (and optionally chaos)
+  + tools in PATH: subfinder, assetfinder, findomain, httpx (ProjectDiscovery), optionally chaos
 
 Examples:
   python subrecon.py -d example.com --chaos-key KEY --github-token TOKEN
@@ -20,11 +20,14 @@ Examples:
 """
 
 import argparse
+import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
@@ -342,6 +345,96 @@ def run_whois(root, subs, threads):
 
 
 # ----------------------------------------------------------------------------
+# HTTPX (live check)
+# ----------------------------------------------------------------------------
+HTTPX_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X x.y; rv:42.0) Gecko/20100101 Firefox/42.0"
+
+
+def check_httpx_binary(path):
+    """Return the executable path if it is ProjectDiscovery's httpx, else None."""
+    exe = shutil.which(path)
+    if not exe:
+        log(f"   [!] '{path}' not found in PATH - HTTP check skipped", "y")
+        return None
+    try:
+        p = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=30)
+        txt = ((p.stdout or "") + (p.stderr or "")).lower()
+    except Exception as e:  # noqa
+        log(f"   [!] could not run httpx: {e}", "y")
+        return None
+    if "projectdiscovery" in txt or "current version" in txt:
+        return exe
+    log("   [!] The 'httpx' in PATH is not ProjectDiscovery's httpx (maybe the Python "
+        "httpx CLI). Use --httpx-path /path/to/pd-httpx - HTTP check skipped", "y")
+    return None
+
+
+def run_httpx(root, hosts, exe, threads):
+    """
+    Equivalent of:
+      cat subdomains.txt | httpx -silent -follow-host-redirects -title -status-code -cdn
+         -tech-detect -H "user-agent:..." -H "referer:https://<root>" -threads N
+    (+ -json for reliable parsing). Returns {host: info}.
+    """
+    results = {}
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+    try:
+        tmp.write("\n".join(hosts) + "\n")
+        tmp.close()
+        cmd = [exe, "-l", tmp.name, "-silent", "-json", "-follow-host-redirects",
+               "-title", "-status-code", "-cdn", "-tech-detect",
+               "-H", f"user-agent:{HTTPX_UA}",
+               "-H", f"referer:https://{root}",
+               "-threads", str(threads)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True)
+        t0 = time.time()
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                host = (row.get("input") or "").lower().strip()
+                if not host:
+                    host = re.sub(r"^https?://", "", row.get("url", "")).split("/")[0].split(":")[0].lower()
+                if not host:
+                    continue
+                cdn = ""
+                if row.get("cdn"):
+                    cdn = row.get("cdn_name") or "yes"
+                tech = row.get("tech") or row.get("technologies") or []
+                info = {
+                    "url": row.get("url", ""),
+                    "status": row.get("status_code", row.get("status-code", "")),
+                    "title": (row.get("title") or "").strip(),
+                    "cdn": cdn,
+                    "tech": ", ".join(tech) if isinstance(tech, list) else str(tech),
+                }
+                if host not in results or (not results[host]["status"] and info["status"]):
+                    results[host] = info
+                print(f"\r   live hosts found: {len(results)}/{len(hosts)} "
+                      f"({time.time() - t0:.0f}s)", end="", flush=True)
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.kill()
+            raise
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        print()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    return results
+
+
+# ----------------------------------------------------------------------------
 # Excel
 # ----------------------------------------------------------------------------
 FONT = "Arial"
@@ -352,10 +445,18 @@ BAND = "F2F6FC"
 thin = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-HEADERS = ["#", "Root Domain", "Subdomain", "IP Address(es)", "Sources", "Source Count",
+HEADERS = ["#", "Root Domain", "Subdomain", "IP Address(es)", "http_live", "Status Code",
+           "Title", "CDN", "Technologies", "HTTP URL", "Sources", "Source Count",
            "WHOIS Source", "Registrar", "Organization", "Country", "Created",
            "Expires", "Updated", "Name Servers", "Emails", "Status"]
-WIDTHS = [6, 22, 40, 24, 30, 13, 22, 28, 28, 10, 13, 13, 13, 40, 32, 36]
+WIDTHS = [6, 22, 40, 24, 12, 13, 34, 16, 36, 42, 30, 13, 22, 28, 28, 10, 13, 13, 13, 40, 32, 36]
+COL = {h: i + 1 for i, h in enumerate(HEADERS)}
+CENTER = {"#", "http_live", "Status Code", "Source Count", "Country", "Created", "Expires", "Updated"}
+WRAP = {"IP Address(es)", "Title", "Technologies", "Sources", "Name Servers", "Emails", "Status"}
+
+
+def L(name):
+    return get_column_letter(COL[name])
 
 
 def style_header(ws, row, ncols, fill=NAVY):
@@ -365,6 +466,20 @@ def style_header(ws, row, ncols, fill=NAVY):
         cell.fill = PatternFill("solid", fgColor=fill)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = BORDER
+
+
+def status_color(code):
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "000000"
+    if code < 300:
+        return "1E7B34"
+    if code < 400:
+        return "2F5597"
+    if code < 500:
+        return "C55A11"
+    return "C00000"
 
 
 def build_excel(all_data, path, tool_names):
@@ -378,32 +493,48 @@ def build_excel(all_data, path, tool_names):
     ws.row_dimensions[1].height = 28
 
     n = 0
-    for root, (subs, meta) in all_data.items():
+    for root, (subs, meta, http) in all_data.items():
         for host, srcs in subs.items():
             ips, wsrc, info = meta.get(host, ("", "", {}))
+            if http is None:                      # httpx not run
+                live, h = "N/A", {}
+            else:
+                h = http.get(host)
+                live = h is not None
+                h = h or {}
             n += 1
             ws.append([
-                n, root, host, ips, ", ".join(sorted(srcs)), len(srcs), wsrc,
+                n, root, host, ips, live, h.get("status", ""), h.get("title", ""),
+                h.get("cdn", ""), h.get("tech", ""), h.get("url", ""),
+                ", ".join(sorted(srcs)), len(srcs), wsrc,
                 info.get("registrar", ""), info.get("org", ""), info.get("country", ""),
                 info.get("created", ""), info.get("expires", ""), info.get("updated", ""),
                 info.get("ns", ""), info.get("emails", ""), info.get("status", ""),
             ])
     last = ws.max_row
+    green = PatternFill("solid", fgColor="C6EFCE")
+    red = PatternFill("solid", fgColor="FFC7CE")
     for r in range(2, last + 1):
-        fill = PatternFill("solid", fgColor=BAND) if r % 2 == 0 else None
-        for c in range(1, len(HEADERS) + 1):
+        band = PatternFill("solid", fgColor=BAND) if r % 2 == 0 else None
+        for c, name in enumerate(HEADERS, 1):
             cell = ws.cell(row=r, column=c)
             cell.font = Font(name=FONT, size=10)
             cell.border = BORDER
             cell.alignment = Alignment(vertical="center",
-                                       horizontal="center" if c in (1, 6, 10, 11, 12, 13) else "left",
-                                       wrap_text=c in (4, 5, 14, 15, 16))
-            if fill:
-                cell.fill = fill
-        # highlight hosts that resolve
-        ws.cell(row=r, column=4).font = Font(
-            name=FONT, size=10,
-            color="1E7B34" if ws.cell(row=r, column=4).value else "999999")
+                                       horizontal="center" if name in CENTER else "left",
+                                       wrap_text=name in WRAP)
+            if band:
+                cell.fill = band
+        ip = ws.cell(row=r, column=COL["IP Address(es)"])
+        ip.font = Font(name=FONT, size=10, color="1E7B34" if ip.value else "999999")
+        live = ws.cell(row=r, column=COL["http_live"])
+        if live.value is True:
+            live.fill, live.font = green, Font(name=FONT, size=10, bold=True, color="006100")
+        elif live.value is False:
+            live.fill, live.font = red, Font(name=FONT, size=10, bold=True, color="9C0006")
+        sc = ws.cell(row=r, column=COL["Status Code"])
+        if sc.value not in (None, ""):
+            sc.font = Font(name=FONT, size=10, bold=True, color=status_color(sc.value))
     for i, w in enumerate(WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "D2"
@@ -419,23 +550,27 @@ def build_excel(all_data, path, tool_names):
     sm["A2"] = f"Generated: {datetime.now():%Y-%m-%d %H:%M}"
     sm["A2"].font = Font(name=FONT, size=10, italic=True, color="666666")
 
+    root_c, ip_c, live_c, src_c = L("Root Domain"), L("IP Address(es)"), L("http_live"), L("Sources")
     sm.append([])
-    sm.append(["Root Domain", "Total Subdomains", "Resolving (has IP)"])
+    sm.append(["Root Domain", "Total Subdomains", "Resolving (has IP)", "http_live = TRUE"])
     hdr = sm.max_row
-    style_header(sm, hdr, 3, BLUE)
+    style_header(sm, hdr, 4, BLUE)
     first_dom = hdr + 1
     for root in all_data:
         r = sm.max_row + 1
         sm.cell(row=r, column=1, value=root)
-        sm.cell(row=r, column=2, value=f"=COUNTIF(Subdomains!$B:$B,A{r})")
-        sm.cell(row=r, column=3, value=f'=COUNTIFS(Subdomains!$B:$B,A{r},Subdomains!$D:$D,"?*")')
+        sm.cell(row=r, column=2, value=f"=COUNTIF(Subdomains!${root_c}:${root_c},A{r})")
+        sm.cell(row=r, column=3,
+                value=f'=COUNTIFS(Subdomains!${root_c}:${root_c},A{r},Subdomains!${ip_c}:${ip_c},"?*")')
+        sm.cell(row=r, column=4,
+                value=f"=COUNTIFS(Subdomains!${root_c}:${root_c},A{r},Subdomains!${live_c}:${live_c},TRUE)")
     last_dom = sm.max_row
     r = last_dom + 1
     sm.cell(row=r, column=1, value="TOTAL")
-    sm.cell(row=r, column=2, value=f"=SUM(B{first_dom}:B{last_dom})")
-    sm.cell(row=r, column=3, value=f"=SUM(C{first_dom}:C{last_dom})")
+    for c, col in ((2, "B"), (3, "C"), (4, "D")):
+        sm.cell(row=r, column=c, value=f"=SUM({col}{first_dom}:{col}{last_dom})")
     for rr in range(first_dom, r + 1):
-        for c in range(1, 4):
+        for c in range(1, 5):
             cell = sm.cell(row=rr, column=c)
             cell.font = Font(name=FONT, size=11, bold=(rr == r))
             cell.border = BORDER
@@ -452,7 +587,8 @@ def build_excel(all_data, path, tool_names):
     for i, t in enumerate(tool_names, 1):
         rr = h2 + i
         sm.cell(row=rr, column=1, value=t)
-        sm.cell(row=rr, column=2, value=f'=COUNTIF(Subdomains!$E:$E,"*"&A{rr}&"*")')
+        sm.cell(row=rr, column=2,
+                value=f'=COUNTIF(Subdomains!${src_c}:${src_c},"*"&A{rr}&"*")')
         for c in (1, 2):
             cell = sm.cell(row=rr, column=c)
             cell.font = Font(name=FONT, size=11)
@@ -461,8 +597,8 @@ def build_excel(all_data, path, tool_names):
             if i % 2 == 0:
                 cell.fill = PatternFill("solid", fgColor=BAND)
     sm.column_dimensions["A"].width = 30
-    sm.column_dimensions["B"].width = 22
-    sm.column_dimensions["C"].width = 22
+    for col in "BCD":
+        sm.column_dimensions[col].width = 22
 
     wb.save(path)
     log(f"\n[Excel] Saved -> {path}", "g")
@@ -488,25 +624,39 @@ def load_domains(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Subdomain enumeration + WHOIS + Excel report")
+    ap = argparse.ArgumentParser(description="Subdomain enumeration + WHOIS + httpx + Excel report")
     ap.add_argument("-d", "--domain", nargs="+", help="one or more domains")
     ap.add_argument("-l", "--list", help="file containing domains (one per line)")
     ap.add_argument("--chaos-key", help="Chaos (ProjectDiscovery) API key")
     ap.add_argument("--github-token", help="GitHub personal access token")
     ap.add_argument("-o", "--output", default="subdomains_report.xlsx", help="output xlsx path")
     ap.add_argument("-t", "--threads", type=int, default=10, help="threads for DNS/WHOIS")
+    ap.add_argument("--httpx-threads", type=int, default=1, help="httpx -threads value (default 1)")
+    ap.add_argument("--httpx-path", default="httpx", help="path/name of ProjectDiscovery httpx")
+    ap.add_argument("--no-httpx", action="store_true", help="skip the httpx live check")
     opts = ap.parse_args()
 
     domains = load_domains(opts)
     if not domains:
         ap.error("no valid domain given (use -d and/or -l)")
 
+    httpx_exe = None
+    if not opts.no_httpx:
+        httpx_exe = check_httpx_binary(opts.httpx_path)
+
     log(f"{C['bold']}Loaded {len(domains)} domain(s){C['end']}", "g")
     all_data = {}
     for i, dom in enumerate(domains, 1):
         subs = enumerate_domain(dom, i, len(domains), opts)
         meta = run_whois(dom, list(subs), opts.threads) if subs else {}
-        all_data[dom] = (subs, meta)
+
+        http = None
+        if httpx_exe and subs:
+            log(f"\n[HTTPX] Probing {len(subs)} hosts of {dom} "
+                f"(threads={opts.httpx_threads}) ...", "m")
+            http = run_httpx(dom, list(subs), httpx_exe, opts.httpx_threads)
+            log(f"   [+] Live: {len(http)} | Down: {len(subs) - len(http)}", "g")
+        all_data[dom] = (subs, meta, http)
 
     build_excel(all_data, opts.output, [n for n, _ in SOURCES])
     log("Done.", "g")
