@@ -6,7 +6,7 @@ subrecon.py - Subdomain enumeration pipeline with WHOIS and a styled Excel repor
 Steps (per domain):
   1. Subfinder      2. Assetfinder   3. Findomain
   4. Chaos (API)    5. crt.sh        6. GitHub Dorking (token)
-  then: merge + dedupe + sort -> DNS resolve + WHOIS -> httpx (http_live) -> Excel
+  then: merge + dedupe + sort -> DNS resolve + WHOIS -> httpx (http_live) -> custom wordlist -> Excel + JSON
 
 Use ONLY on domains you own or are explicitly authorized to test.
 
@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import requests
 
@@ -482,6 +482,29 @@ def status_color(code):
     return "C00000"
 
 
+def build_wordlist(all_data):
+    """
+    Python equivalent of:
+      cat subs.txt | rev | cut -d . -f 3 | rev | sort -u
+    i.e. the label directly to the left of the root domain
+    (a.b.example.com -> b, x.example.com -> x). Returns sorted
+    [(word, usage_count, root_domains)].
+    """
+    words = {}
+    for root, (subs, _meta, _http) in all_data.items():
+        suffix = "." + root
+        for host in subs:
+            if not host.endswith(suffix):
+                continue
+            word = host[:-len(suffix)].split(".")[-1]
+            if not word:
+                continue
+            e = words.setdefault(word, {"count": 0, "roots": set()})
+            e["count"] += 1
+            e["roots"].add(root)
+    return [(w, words[w]["count"], ", ".join(sorted(words[w]["roots"]))) for w in sorted(words)]
+
+
 def build_excel(all_data, path, tool_names):
     wb = Workbook()
 
@@ -541,6 +564,29 @@ def build_excel(all_data, path, tool_names):
     if last >= 2:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}{last}"
     ws.sheet_view.zoomScale = 90
+
+    # ---- Wordlist sheet (custom wordlist built from all subdomains) ----
+    wl = wb.create_sheet("Wordlist")
+    wl_headers = ["#", "Word", "Used In (subdomains)", "Root Domains"]
+    wl.append(wl_headers)
+    style_header(wl, 1, len(wl_headers))
+    wl.row_dimensions[1].height = 28
+    for i, (word, cnt, roots) in enumerate(build_wordlist(all_data), 1):
+        wl.append([i, word, cnt, roots])
+    for r in range(2, wl.max_row + 1):
+        for c in range(1, 5):
+            cell = wl.cell(row=r, column=c)
+            cell.font = Font(name=FONT, size=10)
+            cell.border = BORDER
+            cell.alignment = Alignment(vertical="center",
+                                       horizontal="center" if c in (1, 3) else "left")
+            if r % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor=BAND)
+    for col, w in zip("ABCD", (7, 34, 22, 45)):
+        wl.column_dimensions[col].width = w
+    wl.freeze_panes = "A2"
+    if wl.max_row >= 2:
+        wl.auto_filter.ref = f"A1:D{wl.max_row}"
 
     # ---- Summary sheet (formulas reference the Subdomains sheet) ----
     sm = wb.create_sheet("Summary", 0)
@@ -623,6 +669,106 @@ def load_domains(args):
     return clean
 
 
+# ----------------------------------------------------------------------------
+# JSON export
+# ----------------------------------------------------------------------------
+def _none(v):
+    return None if v in ("", None) else v
+
+
+def _split(v):
+    return [x.strip() for x in v.split(",") if x.strip()] if v else []
+
+
+def build_json(all_data, path, tool_names):
+    """Write a clean, sorted, machine-readable report (schema_version 1.0)."""
+    per_source = {t: 0 for t in tool_names}
+    domains_out = []
+    tot_subs = tot_res = 0
+    tot_live = 0
+    http_ran = False
+
+    for root in sorted(all_data):
+        subs, meta, http = all_data[root]
+        items, res, live = [], 0, 0
+        for host in sorted(subs):
+            srcs = sorted(subs[host])
+            for t in srcs:
+                if t in per_source:
+                    per_source[t] += 1
+            ips, wsrc, info = meta.get(host, ("", "", {}))
+            ip_list = _split(ips)
+            res += bool(ip_list)
+
+            h = {}
+            is_live = None
+            if http is not None:
+                http_ran = True
+                h = http.get(host) or {}
+                is_live = host in http
+                live += is_live
+            code = h.get("status", "")
+            try:
+                code = int(code)
+            except (TypeError, ValueError):
+                code = None
+
+            items.append({
+                "subdomain": host,
+                "ips": ip_list,
+                "resolves": bool(ip_list),
+                "http_live": is_live,
+                "status_code": code,
+                "title": _none(h.get("title")),
+                "cdn": _none(h.get("cdn")),
+                "technologies": _split(h.get("tech")),
+                "http_url": _none(h.get("url")),
+                "sources": srcs,
+                "source_count": len(srcs),
+                "whois": {
+                    "source": _none(wsrc),
+                    "registrar": _none(info.get("registrar")),
+                    "organization": _none(info.get("org")),
+                    "country": _none(info.get("country")),
+                    "created": _none(info.get("created")),
+                    "expires": _none(info.get("expires")),
+                    "updated": _none(info.get("updated")),
+                    "name_servers": _split(info.get("ns")),
+                    "emails": _split(info.get("emails")),
+                    "status": _split(info.get("status")),
+                },
+            })
+        tot_subs += len(items)
+        tot_res += res
+        tot_live += live
+        domains_out.append({
+            "domain": root,
+            "stats": {"total_subdomains": len(items), "resolving": res,
+                      "http_live": live if http is not None else None},
+            "subdomains": items,
+        })
+
+    report = {
+        "schema_version": "1.0",
+        "tool": "subrecon",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "summary": {
+            "total_domains": len(domains_out),
+            "total_subdomains": tot_subs,
+            "resolving": tot_res,
+            "http_live": tot_live if http_ran else None,
+            "per_source": per_source,
+        },
+        "domains": domains_out,
+        "wordlist": [{"word": w, "count": c, "root_domains": _split(r)}
+                     for w, c, r in build_wordlist(all_data)],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    log(f"[JSON] Saved -> {path}", "g")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Subdomain enumeration + WHOIS + httpx + Excel report")
     ap.add_argument("-d", "--domain", nargs="+", help="one or more domains")
@@ -659,6 +805,13 @@ def main():
         all_data[dom] = (subs, meta, http)
 
     build_excel(all_data, opts.output, [n for n, _ in SOURCES])
+
+    words = build_wordlist(all_data)
+    wl_path = os.path.splitext(opts.output)[0] + "_wordlist.txt"
+    with open(wl_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(w for w, _, _ in words) + ("\n" if words else ""))
+    log(f"[Wordlist] {len(words)} unique words -> sheet 'Wordlist' and {wl_path}", "g")
+    build_json(all_data, os.path.splitext(opts.output)[0] + ".json", [n for n, _ in SOURCES])
     log("Done.", "g")
 
 

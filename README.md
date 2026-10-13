@@ -11,6 +11,8 @@ A Python pipeline for subdomain enumeration. It runs several sources one by one,
 - Normalizes, de-duplicates and sorts all results, and records which sources found each host
 - Probes every host with ProjectDiscovery `httpx` (last step) and adds an `http_live` column (TRUE/FALSE) plus status code, title, CDN and technologies
 - Resolves IP addresses and collects WHOIS fields (registrar, org, country, created, expires, updated, name servers, emails, status)
+- Builds a custom wordlist from all found subdomains (the label next to the root domain, same as `rev | cut -d . -f 3 | rev | sort -u`), saved in a `Wordlist` sheet and in `<output>_wordlist.txt`
+- Exports a sorted, typed JSON report (`<output>.json`) ready to feed into another system
 - Exports a styled `.xlsx` with a `Summary` sheet and a `Subdomains` sheet (filters, frozen panes, banded rows)
 
 ## How it works
@@ -102,6 +104,7 @@ python subrecon.py -l domains.txt --chaos-key "$CHAOS_KEY" --github-token "$GH_T
 
 ## Output
 
+`Wordlist` sheet: unique words, how many subdomains use each, and the root domains they come from.
 `Summary` sheet: totals per domain, resolving hosts, and results per source (formulas).
 `Subdomains` sheet: root domain, subdomain, IPs, sources, source count, WHOIS source and WHOIS fields.
 
@@ -117,3 +120,37 @@ python subrecon.py -l domains.txt --chaos-key "$CHAOS_KEY" --github-token "$GH_T
 ## License
 
 MIT (add a `LICENSE` file).
+
+## JSON output
+
+Written next to the Excel file (`report.xlsx` -> `report.json`). Structure (`schema_version` 1.0):
+
+```json
+{
+  "schema_version": "1.0",
+  "tool": "subrecon",
+  "generated_at": "2026-10-13T10:00:00+00:00",
+  "summary": {"total_domains": 1, "total_subdomains": 2, "resolving": 1, "http_live": 1,
+              "per_source": {"Subfinder": 1, "crt.sh": 2}},
+  "domains": [
+    {
+      "domain": "example.com",
+      "stats": {"total_subdomains": 2, "resolving": 1, "http_live": 1},
+      "subdomains": [
+        {
+          "subdomain": "a.example.com", "ips": ["1.1.1.1"], "resolves": true,
+          "http_live": true, "status_code": 200, "title": "Home", "cdn": "cloudflare",
+          "technologies": ["Nginx"], "http_url": "https://a.example.com",
+          "sources": ["crt.sh"], "source_count": 1,
+          "whois": {"source": "root domain", "registrar": "...", "organization": null,
+                    "country": null, "created": "2000-01-01", "expires": null, "updated": null,
+                    "name_servers": [], "emails": [], "status": []}
+        }
+      ]
+    }
+  ],
+  "wordlist": [{"word": "a", "count": 1, "root_domains": ["example.com"]}]
+}
+```
+
+Domains and subdomains are sorted alphabetically. Missing values are `null`, lists are real arrays, `http_live` is `true`/`false` (or `null` if httpx was not run).
