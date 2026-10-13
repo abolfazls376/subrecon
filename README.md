@@ -7,11 +7,12 @@ A Python pipeline for subdomain enumeration. It runs several sources one by one,
 ## Features
 
 - Runs 6 sources in order and shows live progress: Subfinder, Assetfinder, Findomain, Chaos (API key), crt.sh, GitHub Dorking (token)
+- Step 7: brute-forces with `ffuf`, using a wordlist built on the fly from the labels already found in steps 1-6 (no external wordlist file needed), and merges any matches back in, tagged `Ffuf`
 - Accepts a single domain, several domains, or a list file
-- Normalizes, de-duplicates and sorts all results, and records which sources found each host
-- Probes every host with ProjectDiscovery `httpx` (last step) and adds an `http_live` column (TRUE/FALSE) plus status code, title, CDN and technologies
+- Normalizes, de-duplicates and sorts all results, and records which sources (including Ffuf) found each host
+- Probes every host with ProjectDiscovery `httpx` (after ffuf) and adds an `http_live` column (TRUE/FALSE) plus status code, title, CDN and technologies
 - Resolves IP addresses and collects WHOIS fields (registrar, org, country, created, expires, updated, name servers, emails, status)
-- Builds a custom wordlist from all found subdomains (the label next to the root domain, same as `rev | cut -d . -f 3 | rev | sort -u`), saved in a `Wordlist` sheet and in `<output>_wordlist.txt`
+- Builds a custom wordlist from all found subdomains (the label next to the root domain, same as `rev | cut -d . -f 3 | rev | sort -u`), saved in a `Wordlist` sheet and in `<output>_wordlist.txt` — this is the same wordlist ffuf uses internally
 - Exports a sorted, typed JSON report (`<output>.json`) ready to feed into another system
 - Exports a styled `.xlsx` with a `Summary` sheet and a `Subdomains` sheet (filters, frozen panes, banded rows)
 
@@ -27,19 +28,27 @@ input domains
 merge + clean + dedupe + sort
    |
    v
+[7] Ffuf brute-force (wordlist built from the results above)
+   |
+   v
+merge + dedupe + sort
+   |
+   v
 DNS resolve + WHOIS (multi-threaded)
    |
    v
 httpx live check (http_live)
    |
    v
-Excel report
+Excel + JSON report
 ```
+
+Step 7 reuses the labels already discovered (e.g. if `x.stage.example.com` was found, `stage` becomes a word) to probe `https://<word>.<domain>` directly with ffuf, so it can surface hosts like `stage.example.com` that no other source returned on its own.
 
 ## Requirements
 
 - Python 3.9+
-- External tools in your `PATH`: `subfinder`, `assetfinder`, `findomain`, `httpx` (ProjectDiscovery) (optional: `chaos`)
+- External tools in your `PATH`: `subfinder`, `assetfinder`, `findomain`, `ffuf`, `httpx` (ProjectDiscovery) (optional: `chaos`)
 - Python packages: see `requirements.txt`
 
 A missing tool is skipped with a warning; the other steps still run.
@@ -62,6 +71,7 @@ Install the external tools (examples):
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install -v github.com/tomnomnom/assetfinder@latest
 go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install -v github.com/ffuf/ffuf/v2@latest
 export PATH=$PATH:~/go/bin
 # findomain: download a binary from https://github.com/Findomain/Findomain/releases
 ```
@@ -101,6 +111,11 @@ python subrecon.py -l domains.txt --chaos-key "$CHAOS_KEY" --github-token "$GH_T
 | `--httpx-threads` | httpx `-threads` value (default 1) |
 | `--httpx-path` | Path to ProjectDiscovery httpx if the name `httpx` is taken by another tool |
 | `--no-httpx` | Skip the live check (`http_live` becomes `N/A`) |
+| `--ffuf-threads` | ffuf `-t` value (default 50) |
+| `--ffuf-mc` | ffuf `-mc` value, matched status codes (default `200,403`) |
+| `--ffuf-path` | Path to the ffuf binary |
+| `--ffuf-timeout` | ffuf timeout in seconds (default 1800) |
+| `--no-ffuf` | Skip the brute-force step |
 
 ## Output
 
@@ -116,6 +131,8 @@ python subrecon.py -l domains.txt --chaos-key "$CHAOS_KEY" --github-token "$GH_T
 - WHOIS is mostly meaningful for registered domains. For a subdomain the tool tries a direct lookup first and falls back to the root domain; the `WHOIS Source` column shows which was used.
 - GitHub code search is rate limited (about 30 requests/minute), so that step is slow by design.
 - Chaos results depend on the target being in the Chaos dataset.
+- The ffuf wordlist comes only from labels already found in steps 1-6, so it can't invent brand-new words — its value is testing those words directly against the root domain (e.g. turning a deep `x.stage.example.com` into a direct hit on `stage.example.com`). If the first six steps return nothing, step 7 is skipped.
+- `-mc 200,403` means only those status codes count as a match; adjust `--ffuf-mc` (e.g. add `301,302`) if you want more.
 
 ## License
 

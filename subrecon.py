@@ -6,13 +6,14 @@ subrecon.py - Subdomain enumeration pipeline with WHOIS and a styled Excel repor
 Steps (per domain):
   1. Subfinder      2. Assetfinder   3. Findomain
   4. Chaos (API)    5. crt.sh        6. GitHub Dorking (token)
+  7. Ffuf (brute-force using a wordlist built from steps 1-6)
   then: merge + dedupe + sort -> DNS resolve + WHOIS -> httpx (http_live) -> custom wordlist -> Excel + JSON
 
 Use ONLY on domains you own or are explicitly authorized to test.
 
 Install:
   pip install requests python-whois openpyxl
-  + tools in PATH: subfinder, assetfinder, findomain, httpx (ProjectDiscovery), optionally chaos
+  + tools in PATH: subfinder, assetfinder, findomain, ffuf, httpx (ProjectDiscovery), optionally chaos
 
 Examples:
   python subrecon.py -d example.com --chaos-key KEY --github-token TOKEN
@@ -247,6 +248,105 @@ def enumerate_domain(domain, d_idx, d_total, opts):
     results = {h: results[h] for h in sorted(results)}
     log(f"   [+] Total unique subdomains: {len(results)}", "g")
     return results
+
+
+# ----------------------------------------------------------------------------
+# Ffuf (wordlist brute-force, step 7)
+# ----------------------------------------------------------------------------
+def words_from_subs(subs, root):
+    """The label directly left of the root domain, for every known subdomain
+    (same rule as build_wordlist: a.b.example.com -> 'b'). Used to build the
+    wordlist that feeds ffuf."""
+    suffix = "." + root
+    words = set()
+    for host in subs:
+        if host.endswith(suffix):
+            w = host[: -len(suffix)].split(".")[-1]
+            if w:
+                words.add(w)
+    return sorted(words)
+
+
+def check_ffuf_binary(path):
+    exe = shutil.which(path)
+    if not exe:
+        log(f"   [!] '{path}' not found in PATH - Ffuf step skipped", "y")
+        return None
+    return exe
+
+
+def run_ffuf(root, words, exe, threads, mc, timeout=1800):
+    """
+    Equivalent of:
+      ffuf -u https://FUZZ.<root> -w wordlist.txt -t <threads> -mc <mc> -o out.json
+    Returns the set of hosts ffuf matched (status code in `mc`).
+    """
+    wl = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+    out_path = wl.name + ".out.json"
+    try:
+        wl.write("\n".join(words) + "\n")
+        wl.close()
+        cmd = [exe, "-u", f"https://FUZZ.{root}", "-w", wl.name,
+               "-t", str(threads), "-mc", mc, "-o", out_path, "-of", "json", "-s"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log(f"   [!] ffuf timed out after {timeout}s", "y")
+            return set()
+        except Exception as e:  # noqa
+            log(f"   [!] ffuf failed: {e}", "r")
+            return set()
+        if not os.path.exists(out_path):
+            err = (p.stderr or "").strip().splitlines()
+            log(f"   [!] ffuf produced no output (exit {p.returncode}): "
+                f"{err[-1] if err else 'unknown error'}", "y")
+            return set()
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa
+            log(f"   [!] could not parse ffuf JSON output: {e}", "y")
+            return set()
+        raw = []
+        for row in data.get("results", []):
+            host = (row.get("host") or "").strip().lower()
+            if not host:
+                host = re.sub(r"^https?://", "", row.get("url", "")).split("/")[0].split(":")[0]
+            if host:
+                raw.append(host)
+        return clean_hosts(raw, root)
+    finally:
+        for p_ in (wl.name, out_path):
+            try:
+                os.unlink(p_)
+            except OSError:
+                pass
+
+
+def run_ffuf_step(domain, subs, d_idx, d_total, opts):
+    """Step 7: brute-force with ffuf using a wordlist built from steps 1-6,
+    then merge any new/matching hosts back into `subs`, tagged 'Ffuf'."""
+    step(d_idx, d_total, 7, 7, "Ffuf (wordlist brute-force)", domain)
+    if opts.no_ffuf:
+        log("   [!] --no-ffuf set - skipped", "y")
+        return subs
+    exe = check_ffuf_binary(opts.ffuf_path)
+    if not exe:
+        return subs
+    words = words_from_subs(subs, domain)
+    if not words:
+        log("   [!] no words available yet to build a wordlist - skipped", "y")
+        return subs
+    log(f"   [+] Wordlist built from current results: {len(words)} words", "c")
+    t0 = time.time()
+    found = run_ffuf(domain, words, exe, opts.ffuf_threads, opts.ffuf_mc, opts.ffuf_timeout)
+    new = found - set(subs)
+    for h in found:
+        subs.setdefault(h, set()).add("Ffuf")
+    subs = {h: subs[h] for h in sorted(subs)}
+    log(f"   [+] Ffuf: {len(found)} hosts matched (mc={opts.ffuf_mc}), "
+        f"{len(new)} new ({time.time() - t0:.1f}s)", "g")
+    return subs
 
 
 # ----------------------------------------------------------------------------
@@ -780,6 +880,11 @@ def main():
     ap.add_argument("--httpx-threads", type=int, default=1, help="httpx -threads value (default 1)")
     ap.add_argument("--httpx-path", default="httpx", help="path/name of ProjectDiscovery httpx")
     ap.add_argument("--no-httpx", action="store_true", help="skip the httpx live check")
+    ap.add_argument("--ffuf-path", default="ffuf", help="path/name of the ffuf binary")
+    ap.add_argument("--ffuf-threads", type=int, default=50, help="ffuf -t value (default 50)")
+    ap.add_argument("--ffuf-mc", default="200,403", help="ffuf -mc value (default 200,403)")
+    ap.add_argument("--ffuf-timeout", type=int, default=1800, help="ffuf timeout in seconds (default 1800)")
+    ap.add_argument("--no-ffuf", action="store_true", help="skip the ffuf brute-force step")
     opts = ap.parse_args()
 
     domains = load_domains(opts)
@@ -790,10 +895,12 @@ def main():
     if not opts.no_httpx:
         httpx_exe = check_httpx_binary(opts.httpx_path)
 
+    tool_names = [n for n, _ in SOURCES] + ["Ffuf"]
     log(f"{C['bold']}Loaded {len(domains)} domain(s){C['end']}", "g")
     all_data = {}
     for i, dom in enumerate(domains, 1):
         subs = enumerate_domain(dom, i, len(domains), opts)
+        subs = run_ffuf_step(dom, subs, i, len(domains), opts)
         meta = run_whois(dom, list(subs), opts.threads) if subs else {}
 
         http = None
@@ -804,14 +911,14 @@ def main():
             log(f"   [+] Live: {len(http)} | Down: {len(subs) - len(http)}", "g")
         all_data[dom] = (subs, meta, http)
 
-    build_excel(all_data, opts.output, [n for n, _ in SOURCES])
+    build_excel(all_data, opts.output, tool_names)
 
     words = build_wordlist(all_data)
     wl_path = os.path.splitext(opts.output)[0] + "_wordlist.txt"
     with open(wl_path, "w", encoding="utf-8") as f:
         f.write("\n".join(w for w, _, _ in words) + ("\n" if words else ""))
     log(f"[Wordlist] {len(words)} unique words -> sheet 'Wordlist' and {wl_path}", "g")
-    build_json(all_data, os.path.splitext(opts.output)[0] + ".json", [n for n, _ in SOURCES])
+    build_json(all_data, os.path.splitext(opts.output)[0] + ".json", tool_names)
     log("Done.", "g")
 
 
