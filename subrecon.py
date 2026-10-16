@@ -7,13 +7,16 @@ Steps (per domain):
   1. Subfinder      2. Assetfinder   3. Findomain
   4. Chaos (API)    5. crt.sh        6. GitHub Dorking (token)
   7. Ffuf (brute-force using a wordlist built from steps 1-6)
-  then: merge + dedupe + sort -> DNS resolve + WHOIS -> httpx (http_live) -> custom wordlist -> Excel + JSON
+  8. Check CDN (dnsx resolve -> mapcidr filter out CDN IPs)
+  9. Virtual Host Discovery (ffuf Host-header fuzzing with 3 saved wordlists + a merged one)
+  then: DNS resolve + WHOIS -> httpx (http_live) -> custom wordlist -> Excel + JSON
 
 Use ONLY on domains you own or are explicitly authorized to test.
 
 Install:
   pip install requests python-whois openpyxl
-  + tools in PATH: subfinder, assetfinder, findomain, ffuf, httpx (ProjectDiscovery), optionally chaos
+  + tools in PATH: subfinder, assetfinder, findomain, ffuf, dnsx, mapcidr,
+    httpx (ProjectDiscovery), optionally chaos
 
 Examples:
   python subrecon.py -d example.com --chaos-key KEY --github-token TOKEN
@@ -21,6 +24,7 @@ Examples:
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -30,7 +34,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone
 
 import requests
@@ -349,6 +352,281 @@ def run_ffuf_step(domain, subs, d_idx, d_total, opts):
     return subs
 
 
+def get_domain_dir(opts, domain):
+    """A folder named after the domain, created next to --output, where all
+    of that domain's per-domain artifacts (ffuf/CDN/vhost/dnsx files) go."""
+    out_dir = os.path.dirname(os.path.abspath(opts.output)) or "."
+    d = os.path.join(out_dir, domain)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ----------------------------------------------------------------------------
+# Check CDN (step 8): dnsx resolve -> mapcidr filter out CDN IPs
+# ----------------------------------------------------------------------------
+def run_dnsx(hosts, exe, timeout=600):
+    """
+    Equivalent of:
+      cat subdomains.txt | dnsx -silent -resp-only
+    Returns the raw list of resolved IPs (one per resolving host; duplicates
+    and ordering from dnsx are kept as-is).
+    """
+    try:
+        p = subprocess.run([exe, "-silent", "-resp-only"],
+                           input="\n".join(hosts) + "\n",
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"   [!] dnsx timed out after {timeout}s", "y")
+        return []
+    except Exception as e:  # noqa
+        log(f"   [!] dnsx failed: {e}", "r")
+        return []
+    if p.returncode != 0 and not p.stdout.strip():
+        err = (p.stderr or "").strip().splitlines()
+        log(f"   [!] dnsx exited with {p.returncode}: {err[-1] if err else 'no output'}", "y")
+    return [l.strip() for l in p.stdout.splitlines() if l.strip()]
+
+
+def run_dnsx_hosts(hosts, exe, timeout=600):
+    """
+    Equivalent of:
+      cat subdomains.txt | dnsx -silent
+    Returns the raw list of input hosts that resolve (dnsx echoes the
+    hostname itself, not the IP, when -resp-only is not given).
+    """
+    try:
+        p = subprocess.run([exe, "-silent"],
+                           input="\n".join(hosts) + "\n",
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"   [!] dnsx timed out after {timeout}s", "y")
+        return []
+    except Exception as e:  # noqa
+        log(f"   [!] dnsx failed: {e}", "r")
+        return []
+    if p.returncode != 0 and not p.stdout.strip():
+        err = (p.stderr or "").strip().splitlines()
+        log(f"   [!] dnsx exited with {p.returncode}: {err[-1] if err else 'no output'}", "y")
+    return [l.strip() for l in p.stdout.splitlines() if l.strip()]
+
+
+def run_dns_resolution_export(domain, subs, opts):
+    """Runs right before WHOIS:
+         dnsx -silent             -> subdomains that resolve, saved as-is
+         dnsx -silent -resp-only  -> the IPs they resolve to, saved as-is
+       Each command is its own run, each saved to its own text file."""
+    if opts.no_dns_check or not subs:
+        return
+    exe = shutil.which(opts.dnsx_path)
+    if not exe:
+        log(f"   [!] '{opts.dnsx_path}' not found in PATH - dnsx export skipped", "y")
+        return
+    domain_dir = get_domain_dir(opts, domain)
+    hosts = list(subs)
+
+    resolving = run_dnsx_hosts(hosts, exe, opts.dnsx_timeout)
+    p1 = os.path.join(domain_dir, "dns_resolved_subdomains.txt")
+    n1 = save_wordlist(sorted(set(resolving)), p1)
+    log(f"   [+] dnsx -silent: {n1} resolving subdomain(s) -> {p1}", "g")
+
+    ips = run_dnsx(hosts, exe, opts.dnsx_timeout)
+    p2 = os.path.join(domain_dir, "dns_resolved_ips.txt")
+    n2 = save_ip_list(ips, p2)
+    log(f"   [+] dnsx -silent -resp-only: {n2} resolved IP(s) -> {p2}", "g")
+
+
+def run_mapcidr_filter(ips, cdn_file, exe, timeout=300):
+    """
+    Equivalent of:
+      cat subdomains_resolved.txt | mapcidr -filter-ip <cdn_file>
+    Returns the IPs that remain after CDN ranges are filtered out.
+    """
+    if not ips:
+        return []
+    try:
+        p = subprocess.run([exe, "-filter-ip", cdn_file],
+                           input="\n".join(ips) + "\n",
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"   [!] mapcidr timed out after {timeout}s", "y")
+        return []
+    except Exception as e:  # noqa
+        log(f"   [!] mapcidr failed: {e}", "r")
+        return []
+    if p.returncode != 0 and not p.stdout.strip():
+        err = (p.stderr or "").strip().splitlines()
+        log(f"   [!] mapcidr exited with {p.returncode}: {err[-1] if err else 'no output'}", "y")
+        return []
+    return [l.strip() for l in p.stdout.splitlines() if l.strip()]
+
+
+def run_cdn_check_step(domain, subs, d_idx, d_total, opts):
+    """Step 8: resolve all current hosts with dnsx, then drop CDN IPs with
+    mapcidr. Saves resolved_ips.txt / non_cdn_ips.txt into the domain's own
+    output folder. Returns (resolved_ips, non_cdn_ips) - both raw (may repeat)."""
+    step(d_idx, d_total, 8, 8, "Check CDN (dnsx + mapcidr)", domain)
+    if opts.no_cdn_check:
+        log("   [!] --no-cdn-check set - skipped", "y")
+        return [], []
+    if not opts.cdn_ranges:
+        log("   [!] --cdn-ranges not provided - skipped", "y")
+        return [], []
+    if not os.path.isfile(opts.cdn_ranges):
+        log(f"   [!] CDN ranges file not found: {opts.cdn_ranges} - skipped", "y")
+        return [], []
+    dnsx_exe = shutil.which(opts.dnsx_path)
+    if not dnsx_exe:
+        log(f"   [!] '{opts.dnsx_path}' not found in PATH - skipped", "y")
+        return [], []
+    mapcidr_exe = shutil.which(opts.mapcidr_path)
+    if not mapcidr_exe:
+        log(f"   [!] '{opts.mapcidr_path}' not found in PATH - skipped", "y")
+        return [], []
+    if not subs:
+        log("   [!] no subdomains to resolve - skipped", "y")
+        return [], []
+
+    domain_dir = get_domain_dir(opts, domain)
+
+    t0 = time.time()
+    resolved = run_dnsx(list(subs), dnsx_exe, opts.dnsx_timeout)
+    log(f"   [+] dnsx: {len(set(resolved))} unique IP(s) resolved "
+        f"({time.time() - t0:.1f}s)", "g")
+    if not resolved:
+        return [], []
+
+    t1 = time.time()
+    non_cdn = run_mapcidr_filter(resolved, opts.cdn_ranges, mapcidr_exe, opts.mapcidr_timeout)
+    removed = len(set(resolved)) - len(set(non_cdn))
+    log(f"   [+] mapcidr: {len(set(non_cdn))} non-CDN IP(s) kept, "
+        f"{removed} CDN IP(s) filtered out ({time.time() - t1:.1f}s)", "g")
+
+    rp = os.path.join(domain_dir, "resolved_ips.txt")
+    np_ = os.path.join(domain_dir, "non_cdn_ips.txt")
+    save_ip_list(resolved, rp)
+    save_ip_list(non_cdn, np_)
+    log(f"   [+] Saved -> {rp}", "g")
+    log(f"   [+] Saved -> {np_}", "g")
+    return resolved, non_cdn
+
+
+def save_ip_list(ips, path):
+    """Deduplicate, sort as real IP addresses when possible, and write one per line."""
+    uniq = set(ips)
+    try:
+        ordered = sorted(uniq, key=ipaddress.ip_address)
+    except ValueError:
+        ordered = sorted(uniq)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ordered) + ("\n" if ordered else ""))
+    return len(ordered)
+
+
+# ----------------------------------------------------------------------------
+# Virtual Host Discovery (step 9): 3 wordlists + merge -> ffuf Host-header fuzzing
+# ----------------------------------------------------------------------------
+def save_wordlist(items, path):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(items) + ("\n" if items else ""))
+    return len(items)
+
+
+def run_vhost_ffuf(domain, wordlist_path, exe, threads, mc, timeout=1800):
+    """
+    Equivalent of:
+      ffuf -w wordlist.txt -u "https://<domain>" -H "host:FUZZ"
+           -H "user-agent:<HTTPX_UA>" -mc <mc>
+    Returns the sorted, deduplicated list of Host-header values that matched.
+    """
+    out_path = wordlist_path + ".out.json"
+    cmd = [exe, "-w", wordlist_path, "-u", f"https://{domain}",
+           "-H", "host:FUZZ", "-H", f"user-agent:{HTTPX_UA}",
+           "-t", str(threads), "-mc", mc, "-o", out_path, "-of", "json", "-s"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"   [!] ffuf (vhost) timed out after {timeout}s", "y")
+        return []
+    except Exception as e:  # noqa
+        log(f"   [!] ffuf (vhost) failed: {e}", "r")
+        return []
+    if not os.path.exists(out_path):
+        err = (p.stderr or "").strip().splitlines()
+        log(f"   [!] ffuf (vhost) produced no output (exit {p.returncode}): "
+            f"{err[-1] if err else 'unknown error'}", "y")
+        return []
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:  # noqa
+        log(f"   [!] could not parse ffuf (vhost) JSON output: {e}", "y")
+        return []
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+    matches = set()
+    for row in data.get("results", []):
+        val = (row.get("input", {}) or {}).get("FUZZ", "")
+        val = val.strip() if isinstance(val, str) else ""
+        if val:
+            matches.add(val)
+    return sorted(matches)
+
+
+def run_vhost_discovery_step(domain, subs, d_idx, d_total, opts):
+    """Step 9 (runs after everything else for this domain):
+       1) single-word list (labels found so far)
+       2) that list with the domain appended (word.domain)
+       3) every full subdomain found so far
+       4) all three merged + deduped
+       then ffuf Host-header fuzzes `domain` with the merged list and saves
+       matches (status in --vhost-mc) to a text file."""
+    step(d_idx, d_total, 9, 9, "Virtual Host Discovery", domain)
+    if opts.no_vhost:
+        log("   [!] --no-vhost set - skipped", "y")
+        return []
+    exe = check_ffuf_binary(opts.ffuf_path)
+    if not exe:
+        return []
+    if not subs:
+        log("   [!] no subdomains available yet - skipped", "y")
+        return []
+
+    words = words_from_subs(subs, domain)
+    word_domain = [f"{w}.{domain}" for w in words]
+    all_subs = sorted(subs)
+    merged = sorted(set(words) | set(word_domain) | set(all_subs))
+
+    domain_dir = get_domain_dir(opts, domain)
+    p1 = os.path.join(domain_dir, "vhost_1_words.txt")
+    p2 = os.path.join(domain_dir, "vhost_2_word_domain.txt")
+    p3 = os.path.join(domain_dir, "vhost_3_all_subs.txt")
+    pm = os.path.join(domain_dir, "vhost_4_merged.txt")
+
+    n1 = save_wordlist(words, p1)
+    n2 = save_wordlist(word_domain, p2)
+    n3 = save_wordlist(all_subs, p3)
+    nm = save_wordlist(merged, pm)
+    log(f"   [+] Wordlist 1 (words): {n1} -> {p1}", "c")
+    log(f"   [+] Wordlist 2 (word.domain): {n2} -> {p2}", "c")
+    log(f"   [+] Wordlist 3 (all subdomains): {n3} -> {p3}", "c")
+    log(f"   [+] Merged wordlist: {nm} unique entries -> {pm}", "c")
+
+    if not merged:
+        log("   [!] merged wordlist is empty - ffuf skipped", "y")
+        return []
+
+    t0 = time.time()
+    matches = run_vhost_ffuf(domain, pm, exe, opts.vhost_threads, opts.vhost_mc, opts.vhost_timeout)
+    out_path = os.path.join(domain_dir, "vhost_discovered.txt")
+    save_wordlist(matches, out_path)
+    log(f"   [+] Ffuf (Host-header fuzzing): {len(matches)} match(es) "
+        f"(mc={opts.vhost_mc}) -> {out_path} ({time.time() - t0:.1f}s)", "g")
+    return matches
+
+
 # ----------------------------------------------------------------------------
 # DNS + WHOIS
 # ----------------------------------------------------------------------------
@@ -423,23 +701,24 @@ def enrich(host, root, root_whois):
     return host, ips, src, info
 
 
-def run_whois(root, subs, threads):
-    log(f"\n[WHOIS] Collecting DNS + WHOIS for {len(subs)} hosts of {root} ...", "m")
+def run_whois(root, subs, delay=15):
+    """Runs WHOIS one host at a time (no threads), sleeping `delay` seconds
+    between lookups so whois servers don't reset the connection under load."""
+    total = len(subs)
+    log(f"\n[WHOIS] Collecting DNS + WHOIS for {total} host(s) of {root} "
+        f"(sequential, {delay}s between lookups) ...", "m")
     if whois is None:
         log("   [!] python-whois is not installed (pip install python-whois) - "
             "WHOIS columns will be empty", "y")
     root_whois = whois_lookup(root)
     out = {}
-    done = 0
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        futs = [ex.submit(enrich, h, root, root_whois) for h in subs]
-        for f in as_completed(futs):
-            host, ips, src, info = f.result()
-            out[host] = (ips, src, info)
-            done += 1
-            if done % 10 == 0 or done == len(subs):
-                pct = done * 100 // len(subs)
-                print(f"\r   progress: {done}/{len(subs)} ({pct}%)", end="", flush=True)
+    for i, host in enumerate(subs, 1):
+        _, ips, src, info = enrich(host, root, root_whois)
+        out[host] = (ips, src, info)
+        pct = i * 100 // total if total else 100
+        print(f"\r   progress: {i}/{total} ({pct}%)", end="", flush=True)
+        if i < total and delay > 0:
+            time.sleep(delay)
     print()
     return out
 
@@ -869,6 +1148,61 @@ def build_json(all_data, path, tool_names):
     log(f"[JSON] Saved -> {path}", "g")
 
 
+def print_final_checklist(opts):
+    """Prints a green-check / yellow-x summary of which tasks were enabled
+    and available for this run (binary found / credential provided)."""
+    dnsx_ok = shutil.which(opts.dnsx_path) is not None
+    mapcidr_ok = shutil.which(opts.mapcidr_path) is not None
+    ffuf_ok = shutil.which(opts.ffuf_path) is not None
+    httpx_ok = shutil.which(opts.httpx_path) is not None
+
+    if opts.no_cdn_check:
+        cdn_ok, cdn_reason = False, "--no-cdn-check set"
+    elif not opts.cdn_ranges:
+        cdn_ok, cdn_reason = False, "--cdn-ranges not provided"
+    elif not os.path.isfile(opts.cdn_ranges):
+        cdn_ok, cdn_reason = False, "CDN ranges file not found"
+    elif not dnsx_ok:
+        cdn_ok, cdn_reason = False, "dnsx not found in PATH"
+    elif not mapcidr_ok:
+        cdn_ok, cdn_reason = False, "mapcidr not found in PATH"
+    else:
+        cdn_ok, cdn_reason = True, ""
+
+    items = [
+        ("Subfinder", shutil.which("subfinder") is not None, "binary not found in PATH"),
+        ("Assetfinder", shutil.which("assetfinder") is not None, "binary not found in PATH"),
+        ("Findomain", shutil.which("findomain") is not None, "binary not found in PATH"),
+        ("Chaos", bool(opts.chaos_key), "no --chaos-key provided"),
+        ("crt.sh", True, ""),
+        ("GitHub Dorking", bool(opts.github_token), "no --github-token provided"),
+        ("Ffuf (brute-force, step 7)", (not opts.no_ffuf) and ffuf_ok,
+         "--no-ffuf set" if opts.no_ffuf else "ffuf not found in PATH"),
+        ("Check CDN (dnsx + mapcidr)", cdn_ok, cdn_reason),
+        ("Virtual Host Discovery", (not opts.no_vhost) and ffuf_ok,
+         "--no-vhost set" if opts.no_vhost else "ffuf not found in PATH"),
+        ("DNS Export (dnsx -silent)", (not opts.no_dns_check) and dnsx_ok,
+         "--no-dns-check set" if opts.no_dns_check else "dnsx not found in PATH"),
+        ("WHOIS", whois is not None, "python-whois not installed"),
+        ("httpx (live check)", (not opts.no_httpx) and httpx_ok,
+         "--no-httpx set" if opts.no_httpx else "httpx not found in PATH"),
+        ("Excel Report", True, ""),
+        ("JSON Report", True, ""),
+    ]
+
+    print()
+    log("=" * 50, "b")
+    log("  Summary of tasks", "b")
+    log("=" * 50, "b")
+    for name, done, reason in items:
+        if done:
+            print(f"  [{C['g']}\u2713{C['end']}] {name}")
+        else:
+            suffix = f" {C['y']}({reason}){C['end']}" if reason else ""
+            print(f"  [{C['y']}\u2717{C['end']}] {name}{suffix}")
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser(description="Subdomain enumeration + WHOIS + httpx + Excel report")
     ap.add_argument("-d", "--domain", nargs="+", help="one or more domains")
@@ -876,7 +1210,10 @@ def main():
     ap.add_argument("--chaos-key", help="Chaos (ProjectDiscovery) API key")
     ap.add_argument("--github-token", help="GitHub personal access token")
     ap.add_argument("-o", "--output", default="subdomains_report.xlsx", help="output xlsx path")
-    ap.add_argument("-t", "--threads", type=int, default=10, help="threads for DNS/WHOIS")
+    ap.add_argument("--whois-delay", type=float, default=15,
+                    help="seconds to sleep between WHOIS lookups - run sequentially, one host at a time (default 15)")
+    ap.add_argument("--no-dns-check", action="store_true",
+                    help="skip saving the dnsx -silent / dnsx -silent -resp-only exports before WHOIS")
     ap.add_argument("--httpx-threads", type=int, default=1, help="httpx -threads value (default 1)")
     ap.add_argument("--httpx-path", default="httpx", help="path/name of ProjectDiscovery httpx")
     ap.add_argument("--no-httpx", action="store_true", help="skip the httpx live check")
@@ -885,6 +1222,16 @@ def main():
     ap.add_argument("--ffuf-mc", default="200,403", help="ffuf -mc value (default 200,403)")
     ap.add_argument("--ffuf-timeout", type=int, default=1800, help="ffuf timeout in seconds (default 1800)")
     ap.add_argument("--no-ffuf", action="store_true", help="skip the ffuf brute-force step")
+    ap.add_argument("--cdn-ranges", help="path to a plain IPv4 CDN ranges file, for the Check CDN step")
+    ap.add_argument("--dnsx-path", default="dnsx", help="path/name of dnsx")
+    ap.add_argument("--mapcidr-path", default="mapcidr", help="path/name of mapcidr")
+    ap.add_argument("--dnsx-timeout", type=int, default=600, help="dnsx timeout in seconds (default 600)")
+    ap.add_argument("--mapcidr-timeout", type=int, default=300, help="mapcidr timeout in seconds (default 300)")
+    ap.add_argument("--no-cdn-check", action="store_true", help="skip the Check CDN step")
+    ap.add_argument("--vhost-threads", type=int, default=50, help="ffuf -t value for vhost fuzzing (default 50)")
+    ap.add_argument("--vhost-mc", default="200,403,301", help="ffuf -mc value for vhost fuzzing (default 200,403,301)")
+    ap.add_argument("--vhost-timeout", type=int, default=1800, help="vhost ffuf timeout in seconds (default 1800)")
+    ap.add_argument("--no-vhost", action="store_true", help="skip the Virtual Host Discovery step")
     opts = ap.parse_args()
 
     domains = load_domains(opts)
@@ -901,7 +1248,10 @@ def main():
     for i, dom in enumerate(domains, 1):
         subs = enumerate_domain(dom, i, len(domains), opts)
         subs = run_ffuf_step(dom, subs, i, len(domains), opts)
-        meta = run_whois(dom, list(subs), opts.threads) if subs else {}
+        run_cdn_check_step(dom, subs, i, len(domains), opts)
+        run_vhost_discovery_step(dom, subs, i, len(domains), opts)
+        run_dns_resolution_export(dom, subs, opts)
+        meta = run_whois(dom, list(subs), opts.whois_delay) if subs else {}
 
         http = None
         if httpx_exe and subs:
@@ -919,6 +1269,8 @@ def main():
         f.write("\n".join(w for w, _, _ in words) + ("\n" if words else ""))
     log(f"[Wordlist] {len(words)} unique words -> sheet 'Wordlist' and {wl_path}", "g")
     build_json(all_data, os.path.splitext(opts.output)[0] + ".json", tool_names)
+
+    print_final_checklist(opts)
     log("Done.", "g")
 
 
